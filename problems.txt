@@ -1,0 +1,122 @@
+整个项目在跑的时候会调用非常多次llm，以带目录和目录页码的标准pdf文件为例，其工作流程如下：
+1 进入page_index_main()，验证是否为pdf，通过后进入get_page_tokens()
+2 get_page_tokens()逐页读取PDF并提取文本，计算token数，返回page_list，其为[(page_text, token_length)]列表
+3 返回后进入tree_parser()
+    3.1 首先进入check_toc()，在文档前部反复寻找连续的目录页。在find_toc_pages()的toc_detector_single_page()中调用llm，检查单页内容是否包含目录，最大调用次数为toc_check_page_num，默认为20
+        3.1.1 用toc_extractor()提取目录内容，在其中的detect_page_index()调用llm检查目录是否有页码
+        3.1.2 如果目录没有包含页码，继续向后扫描直至找到页码/达到len(page_list)/达到最大轮数
+    3.2 进入meta_processor()，根据目录和页码的不同情况选择对应的模式处理
+        3.2.1 进入process_toc_with_page_numbers()
+            3.2.1.1 在toc_transformer()中不断调用llm直至生成完整的json格式目录，判断依据也是调用llm进行检查，调用次数无上限，是否停止取决于llm回答
+            3.2.2.2 用remove_page_number()递归移除目录JSON中的page_number字段
+            3.2.2.3 在原始每一页的内容前后都加上<physical_index_{page_index+1}>，标注物理页码
+            3.2.2.4 在toc_index_extractor()中调用llm，让模型找目录出现在哪一页（从3.2.1.1的目录开始，而不是3.2.2.3的）
+            3.2.2.5 用extract_matching_page_pairs()配对toc_no_page_number（自己手动加物理页码的目录）和toc_with_physical_index（用llm加物理页码的目录）
+            3.2.2.6 用calculate_page_offset()计算offset（即这两种目录的页数差）
+            3.2.2.7 然后用add_page_offset_to_toc_json()补齐页数
+            3.2.2.8 最后用process_none_page_numbers()检查一次，对仍然没有物理页码的页，再调用llm，给他上下文让他猜测物理页码
+        3.2.2 处理完成后，用validate_and_truncate_physical_indices()验证并截断超出实际文档长度的物理页码，最后以toc_with_page_number为准
+        3.2.3 在verify_toc()中随机（默认检查全部目录项，这非常耗时）抽一些目录项，再调用LLM去正文中确认这个标题是不是确实出现在它标的那一页附近，最后算一个准确率
+            3.2.3.1 verify_toc()会先找toc中最后一个非None的物理页码(last_physical_index)，早停条件是if last_physical_index is None or last_physical_index < len(page_list)/2，直接返回accuracy=0, incorrect_results=[]
+            3.2.3.2 对每个被检查的目录项，在check_title_appearance()中调用llm验证该标题是否出现在该页
+            3.2.3.3 汇总yes的数量计算accuracy，并把no的项收集为incorrect_results
+        3.2.4 根据accuracy和incorrect_results的情况决定下一步
+            3.2.4.1 若accuracy==1.0且incorrect_results为空，直接返回toc_with_page_number
+            3.2.4.2 若accuracy>0.6且incorrect_results非空，则进入fix_incorrect_toc_with_retries()，尝试修复错误页码后返回，修复阶段也会调用很多次llm
+            3.2.4.3 否则，根据传入的mode重新跑一遍meta_processor()，如果一开始是“带目录和页码”，则退到“带目录但无页码”，然后退到“不带目录”，若还失败则抛出异常Processing failed
+    3.3 meta_processor返回后，进入add_preface_if_needed()，如果第一个目录项的physical_index>1，则在最前面插入一个Preface节点("structure": "0", "title": "Preface", "physical_index": 1)
+    3.4 进入check_title_appearance_in_start_concurrent()，对所有有物理页码的含有标题的正文页，调用llm检查这一页是否以标题开头，这时候每一个目录条目都会有一个appear_start标记，判断标题是否在物理页开头
+    3.5 在后处理前，将所有没有物理页码的项删去，然后进入post_processing()，计算每个节点的start_index和end_index
+        3.5.1 start_index直接等于物理页码
+        3.5.2 end_index由下一个节点的appear_start决定，如果为yes，则end_index=next_start-1；否则end_index=next_start（也就是说，这里就能精准定位每个章节的内容到底在哪一页结束）
+        3.5.3 最后一个节点的end_index=最后一页
+        3.5.4 在list_to_tree()中把原来按目录顺序排列的扁平列表按层级关系写成树结构
+    3.6 有了树结构后，进入process_large_node_recursively()用于递归切分过大的节点
+        3.6.1 对于每个节点（也就是每章节的内容），计算页数跨度和token总数
+        3.6.2 如果有一些节点的token过大（token限制可以在配置中调整），就把他单独拆出来，形成一个新的“独立文档”
+        3.6.3 对这个独立文档，再重新来一遍meta_processor()和check_title_appearance_in_start_concurrent()
+        3.6.4 之后对子节点继续检查，直到所有节点都不超出token限制
+        3.6.5 完成后，tree_parser()返回最终的toc_tree
+
+4 page_index_main()根据用户配置，可以加入节点id、加入节点原文、加入节点总结（每个节点都调用llm）和加入文档总结（调用llm）
+    4.1 if_add_node_id==yes：调用write_node_id()为每个节点写入node_id（0000、0001...）
+    4.2 if_add_node_text==yes：调用add_node_text()为每个节点写入text（也就是之前按照start_index和end_index划分好的章节内容）
+    4.3 if_add_node_summary==yes：调用llm为每个节点生成summary
+        4.3.1 generate_summaries_for_structure()会把树摊平成list，对每个节点调用generate_node_summary()
+        4.3.2 若用户不想保留text（if_add_node_text==no），程序会先临时add_node_text生成summary，再remove_structure_text把text删掉
+    4.4 if_add_doc_description==yes：调用llm生成文档描述
+        4.4.1 create_clean_structure_for_description()先裁剪结构，只保留title/node_id/summary等必要字段
+        4.4.2 generate_doc_description()调用llm生成一句话的文档描述
+    4.5 最终返回结果：
+        4.5.1 默认返回{"doc_name": ..., "structure": toc_tree}
+        4.5.2 如果开启doc_description，则返回{"doc_name": ..., "doc_description": ..., "structure": toc_tree}
+
+以下为其它说明：
+
+2 决定了PageIndex的上限，从page_index_main()的get_page_tokens()中就已经开始按照页来扫描了，而不是自然章节
+get_page_tokens()会返回一个page_list，其为 [(page_text, token_length)]列表，例如[("你好", 3), ("早上好", 7)]
+按照页来扫描就无法处理同一页中有不同章节的内容的情况，造成后续应用于llm问答时“张冠李戴”，并且从海船的那个7页测试文档生成的结果中已经发现了错误。
+
+3.1.2 有问题，不应该是没有包含页码才向后扫描，而是无论有没有都要向后扫描，毕竟其本质是为了防止目录被插图等隔开的情况
+
+3.2.1.1 有问题，在toc_transformer()中，会用check_if_toc_transformation_is_complete()判断首次生成的目录结构是否完整
+如果不完整，会到进入以下while循环继续生成：
+while not (if_complete == "yes" and finish_reason == "finished")
+然而这个while循环没有设置最大轮数，有可能会因 JSON 结构损坏导致循环调用API而不会停止，非常危险
+
+3.2.2.3 有问题，main_content这个变量不断添加前后带有物理页码的页面内容，而停止条件是
+for page_index in range(start_page_index, min(start_page_index + toc_check_page_num, len(page_list)))
+则会一直找完全文或直到达到start_page_index + toc_check_page_num（这一步令人疑惑，start_page_index已经是目录后的页面了，为什么还加一个最大目录检查页数的值）
+
+3.2.2.2-3.2.2.8 的本质是要解决“书里目录所标注的页码不同于pdf物理页码”的问题，例如一本书的封面在pdf中就是第一页，然而书里真正的第一页可能是目录第一页甚至正文第一页
+PageIndex在这里面通过对齐这两种页码来解决问题。一个是目录自带的页码，用llm去生成，这是书本页码；另一个是用page_list中的内容直接加好物理标记，然后再让llm生成，这是物理页码
+最后计算他们的差，得到offset后，后续的处理就对齐物理页码，结束之前再调用llm猜一次处理失败的页码，用前后已知页号中间的一段目录再让llm判断一次它应该是哪一页
+但这一整个流程也调用了非常多次llm，而且高度依赖，如果llm中途生成出错，很难排查
+
+3.2.4.3 的三级回退导致在极端情况下，meta_processor()会运行三遍，如果不调整参数，那每一遍都会按照之前流程完整走
+在verify_toc()中默认检查全部目录项（N=None时），如果目录项很多/文档较长，加上不是标准pdf（比如扫描件），那么会造成API调用量爆炸式增长，而且日志里也不一定能快速定位是哪一步触发了大量调用
+
+3.6 process_large_node_recursively()用于递归切分过大的节点，由于它会把所有超出token限制的节点全部当成独立文档，然后所有的独立文档全部跑一遍meta_processor()，这里一不小心也会有非常大的API调用量
+
+4 在海船的7页测试文档中，我们看到的错误的节点总结，根本原因是程序进入了无目录模式，让llm自行生成结构树
+无目录模式让llm直接从正文推断层级结构（generate_toc_init()和generate_toc_continue()）
+输入只是随机截取的7页、且这7页包含3种不同船型的规范时，文本在语义上更像多个并列的小文档拼在一起，而不是一份有主线的单一文档
+这是llm自身的限制，它很容易把相似的条目错误地合并进同一套层级里，造成结构混乱
+无目录模式的分质仍然是按页：start_index只能是某一个physical_index，end_index也只能按下一节点的start_index是否占满整页来决定是否减1
+也就是说如果不同船型的内容在同一页内，这个框架无法在页内切分，必然会把多个船型的内容落到同一个节点的页范围里，导致summary混乱且重复
+verify_toc()验证的目标只是标题是否出现在标注页附近，而并不会验证该节点覆盖的页范围是否只包含该章节的内容
+因此即使节点已经混乱，但标题确实也在节点里出现了，所以accuracy不低，就会通过测试，导致最终生成出混乱的结构
+
+整个PageIndex的核心其实是根据文档有无目录及目录带不带页码，分三种情况来处理文档：process_no_toc / process_toc_no_page_numbers / process_toc_with_page_numbers
+这三种模式的共同点：最终都要产出一个“扁平目录列表”（list），每个元素至少包含title + physical_index（物理页码，int）。之后统一走validate_and_truncate_physical_indices()、verify_toc()、check_title_appearance_in_start_concurrent()、post_processing()等通用后处理。
+这三种模式的差异点：
+process_toc_with_page_numbers：输入目录本身带“书本页码”，需要把书本页码映射到PDF物理页码（算offset对齐）。
+process_toc_no_page_numbers：有目录但目录不带页码，需要直接在正文中定位每个目录项的物理页码。
+process_no_toc：完全没目录，需要让LLM从正文直接生成整套结构（含层级与物理页码）。
+
+process_toc_with_page_numbers（目录有页码）工作流程（核心：两套页码对齐）
+toc_transformer()：LLM把目录文本toc_content转成JSON列表，每项含structure/title/page，其中page是“书本页码/目录页码”（不是PDF物理页码）
+remove_page_number()：复制一份toc，删除page字段，得到toc_no_page_number（用于后续只做“定位”，不受书本页码干扰）
+main_content构造：从目录结束页之后取一段正文页，并给每页前后加<physical_index_X>标签（X为PDF物理页码）
+toc_index_extractor()：LLM在main_content中寻找toc_no_page_number里的标题出现位置，只给“在这段正文里能找到的标题”补physical_index（这是PDF物理页码）
+extract_matching_page_pairs()：用title把（书本页码page）与（物理页码physical_index）配对成若干锚点
+calculate_page_offset()：对每个锚点算diff = physical_index - page，取众数作为offset
+add_page_offset_to_toc_json()：把原toc_with_page_number里所有有page的项转换为physical_index = page + offset，并删除page字段
+process_none_page_numbers()：对少量仍缺physical_index的项，用前后页范围的正文再次调用LLM补全
+最终意义：
+- toc_transformer生成的page代表“书本页码/目录页码”（逻辑页）
+- toc_index_extractor生成的physical_index代表“PDF物理页码”（可直接索引page_list）
+- offset用于把逻辑页 -> 物理页统一映射
+
+process_toc_no_page_numbers（目录无页码）工作流程（核心：逐步补physical_index）
+toc_transformer()：LLM把目录文本转成JSON列表，每项含structure/title/page（通常为None或不可用），这里只把它当作“章节标题列表/层级骨架”
+为全文每一页加<physical_index_X>标签，并按token上限把正文分组（page_list_to_group_text）
+对每个group调用add_page_number_to_toc()：LLM拿“当前正文片段 + 当前structure列表”，判断哪些标题在该片段中开始，并给这些标题写physical_index
+convert_physical_index_to_int()：把<physical_index_X>转成int
+最终意义：该模式不需要offset，因为目录没有“书本页码”可对齐；physical_index全部来自正文定位。
+
+process_no_toc（无目录）工作流程（核心：LLM从正文直接生成结构）
+为全文每一页加<physical_index_X>标签，并按token上限把正文分组（page_list_to_group_text）
+generate_toc_init(第一组正文)：LLM直接输出一个目录列表（含structure/title/physical_index），相当于“从正文抽取章节结构 + 定位章节起generate_toc_continue(后续正文组)：LLM在已有结构基础上继续补全后续章节结构，直到覆盖全文
+convert_physical_index_to_int()：把<physical_index_X>转成int
+最终意义：该模式完全依赖正文内容的可读性与章节信号（标题格式/编号/排版），对“随机截取、多主题并列、页内交错”的文档非常敏感，容易结构混乱。

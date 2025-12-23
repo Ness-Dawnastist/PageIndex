@@ -14,10 +14,12 @@ from dotenv import load_dotenv
 load_dotenv()
 import logging
 import yaml
+import re
 from pathlib import Path
 from types import SimpleNamespace as config
 
 CHATGPT_API_KEY = os.getenv("CHATGPT_API_KEY")
+CHATGPT_BASE_URL=os.getenv("CHATGPT_BASE_URL")
 
 def count_tokens(text, model=None):
     if not text:
@@ -28,7 +30,7 @@ def count_tokens(text, model=None):
 
 def ChatGPT_API_with_finish_reason(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
     max_retries = 10
-    client = openai.OpenAI(api_key=api_key)
+    client = openai.OpenAI(api_key=api_key, base_url=CHATGPT_BASE_URL)
     for i in range(max_retries):
         try:
             if chat_history:
@@ -60,7 +62,7 @@ def ChatGPT_API_with_finish_reason(model, prompt, api_key=CHATGPT_API_KEY, chat_
 
 def ChatGPT_API(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
     max_retries = 10
-    client = openai.OpenAI(api_key=api_key)
+    client = openai.OpenAI(api_key=api_key, base_url=CHATGPT_BASE_URL)
     for i in range(max_retries):
         try:
             if chat_history:
@@ -91,7 +93,7 @@ async def ChatGPT_API_async(model, prompt, api_key=CHATGPT_API_KEY):
     messages = [{"role": "user", "content": prompt}]
     for i in range(max_retries):
         try:
-            async with openai.AsyncOpenAI(api_key=api_key) as client:
+            async with openai.AsyncOpenAI(api_key=api_key, base_url=CHATGPT_BASE_URL) as client:
                 response = await client.chat.completions.create(
                     model=model,
                     messages=messages,
@@ -109,6 +111,7 @@ async def ChatGPT_API_async(model, prompt, api_key=CHATGPT_API_KEY):
             
             
 def get_json_content(response):
+    """去除 response 中的 ```json ``` 和 ``` 标记，提取纯 JSON 内容"""
     start_idx = response.find("```json")
     if start_idx != -1:
         start_idx += 7
@@ -123,16 +126,20 @@ def get_json_content(response):
          
 
 def extract_json(content):
+    """
+    从一段文本（通常是 LLM 输出）里尽量提取并解析出一个 JSON 对象，失败就返回空 {}
+    隐患：不会抛异常，但是返回 {} 会导致后面全部出错但程序不停止，且如果文本里面有None，也会被替换为null，rfind也无法处理多代码块的情况
+    """
     try:
         # First, try to extract JSON enclosed within ```json and ```
         start_idx = content.find("```json")
-        if start_idx != -1:
-            start_idx += 7  # Adjust index to start after the delimiter
-            end_idx = content.rfind("```")
-            json_content = content[start_idx:end_idx].strip()
+        if start_idx != -1: # 如果找到了
+            start_idx += 7  # 越过 ```json 标记
+            end_idx = content.rfind("```") # 找到最后一个 ```
+            json_content = content[start_idx:end_idx].strip() # 提取中间的内容
         else:
             # If no delimiters, assume entire content could be JSON
-            json_content = content.strip()
+            json_content = content.strip() # 提取所有内容
 
         # Clean up common issues that might cause parsing errors
         json_content = json_content.replace('None', 'null')  # Replace Python None with JSON null
@@ -140,7 +147,7 @@ def extract_json(content):
         json_content = ' '.join(json_content.split())  # Normalize whitespace
 
         # Attempt to parse and return the JSON object
-        return json.loads(json_content)
+        return json.loads(json_content) # 尝试解析 JSON
     except json.JSONDecodeError as e:
         logging.error(f"Failed to extract JSON: {e}")
         # Try to clean up the content further if initial parsing fails
@@ -307,6 +314,7 @@ def get_pdf_name(pdf_path):
 
 
 class JsonLogger:
+    # 问题，用了w模式，每次写入会覆盖之前的内容，耗时较长
     def __init__(self, file_path):
         # Extract PDF name for logger name
         pdf_name = get_pdf_name(file_path)
@@ -410,14 +418,17 @@ def add_preface_if_needed(data):
 
 
 
-def get_page_tokens(pdf_path, model="gpt-4o-2024-11-20", pdf_parser="PyPDF2"):
+def get_page_tokens(pdf_path, model="gpt-4o", pdf_parser="PyPDF2"):
+    """
+    逐页读取 PDF 并提取文本，用指定模型的 tokenizer 计算 token 数，返回 page_list，其为 [(page_text, token_length)] 列表
+    """
     enc = tiktoken.encoding_for_model(model)
     if pdf_parser == "PyPDF2":
         pdf_reader = PyPDF2.PdfReader(pdf_path)
         page_list = []
         for page_num in range(len(pdf_reader.pages)):
             page = pdf_reader.pages[page_num]
-            page_text = page.extract_text()
+            page_text = page.extract_text() # 提取文本
             token_length = len(enc.encode(page_text))
             page_list.append((page_text, token_length))
         return page_list
@@ -543,6 +554,9 @@ def check_token_limit(structure, limit=110000):
 
 
 def convert_physical_index_to_int(data):
+    """
+    转换 physical_index 字段为整数
+    """
     if isinstance(data, list):
         for i in range(len(data)):
             # Check if item is a dictionary and has 'physical_index' key
@@ -566,6 +580,9 @@ def convert_physical_index_to_int(data):
 
 
 def convert_page_to_int(data):
+    """
+    转换 page 字段为整数
+    """
     for item in data:
         if 'page' in item and isinstance(item['page'], str):
             try:

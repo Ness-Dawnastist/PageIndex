@@ -10,7 +10,7 @@ if __name__ == "__main__":
     parser.add_argument('--pdf_path', type=str, help='Path to the PDF file')
     parser.add_argument('--md_path', type=str, help='Path to the Markdown file')
 
-    parser.add_argument('--model', type=str, default='gpt-4o-2024-11-20', help='Model to use')
+    parser.add_argument('--model', type=str, default='gpt-4o', help='Model to use')
 
     parser.add_argument('--toc-check-pages', type=int, default=20, 
                       help='Number of pages to check for table of contents (PDF only)')
@@ -23,7 +23,7 @@ if __name__ == "__main__":
                       help='Whether to add node id to the node')
     parser.add_argument('--if-add-node-summary', type=str, default='yes',
                       help='Whether to add summary to the node')
-    parser.add_argument('--if-add-doc-description', type=str, default='no',
+    parser.add_argument('--if-add-doc-description', type=str, default='yes',
                       help='Whether to add doc description to the doc')
     parser.add_argument('--if-add-node-text', type=str, default='no',
                       help='Whether to add text to the node')

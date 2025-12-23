@@ -72,6 +72,9 @@ async def check_title_appearance_in_start(title, page_text, model=None, logger=N
 
 
 async def check_title_appearance_in_start_concurrent(structure, page_list, model=None, logger=None):
+    """
+    并发检查目录项标题是否出现在对应页的开头，返回包含'appear_start'字段的目录结构列表
+    """
     if logger:
         logger.info("Checking title appearance in start concurrently")
     
@@ -102,6 +105,9 @@ async def check_title_appearance_in_start_concurrent(structure, page_list, model
 
 
 def toc_detector_single_page(content, model=None):
+    """
+    检查单页内容中是否包含目录，返回yes或no
+    """
     prompt = f"""
     Your job is to detect if there is a table of content provided in the given text.
 
@@ -114,7 +120,7 @@ def toc_detector_single_page(content, model=None):
     }}
 
     Directly return the final JSON structure. Do not output anything else.
-    Please note: abstract,summary, notation list, figure list, table list, etc. are not table of contents."""
+    Please note: abstract, summary, notation list, figure list, table list, etc. are not table of contents."""
 
     response = ChatGPT_API(model=model, prompt=prompt)
     # print('response', response)
@@ -197,6 +203,9 @@ def extract_toc_content(content, model=None):
     return response
 
 def detect_page_index(toc_content, model=None):
+    """
+    检测目录中是否包含页码/索引，返回yes或no
+    """
     print('start detect_page_index')
     prompt = f"""
     You will be given a table of contents.
@@ -217,7 +226,13 @@ def detect_page_index(toc_content, model=None):
     return json_content['page_index_given_in_toc']
 
 def toc_extractor(page_list, toc_page_list, model):
+    """
+    提取目录内容，并检测目录中是否包含页码/索引，返回目录内容和yes/no
+    """
     def transform_dots_to_colon(text):
+        """
+        把目录中的省略号替换为冒号，方便后续 LLM 识别
+        """
         text = re.sub(r'\.{5,}', ': ', text)
         # Handle dots separated by spaces
         text = re.sub(r'(?:\. ){5,}\.?', ': ', text)
@@ -238,6 +253,9 @@ def toc_extractor(page_list, toc_page_list, model):
 
 
 def toc_index_extractor(toc, content, model=None):
+    """
+    从目录内容和文档内容中提取目录的物理页码/索引，返回包含物理页码/索引的目录 JSON 列表
+    """
     print('start toc_index_extractor')
     tob_extractor_prompt = """
     You are given a table of contents in a json format and several pages of a document, your job is to add the physical_index to the table of contents in the json format.
@@ -268,6 +286,9 @@ def toc_index_extractor(toc, content, model=None):
 
 
 def toc_transformer(toc_content, model=None):
+    """
+    把目录内容转换为 JSON 格式
+    """
     print('start toc_transformer')
     init_prompt = """
     You are given a table of contents, You job is to transform the whole table of content into a JSON format included table_of_contents.
@@ -299,6 +320,7 @@ def toc_transformer(toc_content, model=None):
     last_complete = get_json_content(last_complete)
     while not (if_complete == "yes" and finish_reason == "finished"):
         position = last_complete.rfind('}')
+        # 把 LLM 输出的不完整 JSON 截断到最后一个完整对象之后，丢掉后面所有残缺 JSON 内容
         if position != -1:
             last_complete = last_complete[:position+2]
         prompt = f"""
@@ -331,6 +353,9 @@ def toc_transformer(toc_content, model=None):
 
 
 def find_toc_pages(start_page_index, page_list, opt, logger=None):
+    """
+    从某一页开始向后逐页扫描，找出连续的目录页，并在合适的时候停止，返回目录页码列表，如[2,3,4]，没找到则返回空列表
+    """
     print('start find_toc_pages')
     last_page_is_yes = False
     toc_page_list = []
@@ -358,6 +383,7 @@ def find_toc_pages(start_page_index, page_list, opt, logger=None):
     return toc_page_list
 
 def remove_page_number(data):
+    """递归移除目录 JSON 中的 page_number 字段"""
     if isinstance(data, dict):
         data.pop('page_number', None)  
         for key in list(data.keys()):
@@ -612,7 +638,10 @@ def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_in
 
 
 def process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_check_page_num=None, model=None, logger=None):
-    toc_with_page_number = toc_transformer(toc_content, model)
+    """
+    处理包含页码/索引的目录，返回最终目录 JSON 列表
+    """
+    toc_with_page_number = toc_transformer(toc_content, model) # 把目录内容转换为 JSON 格式
     logger.info(f'toc_with_page_number: {toc_with_page_number}')
 
     toc_no_page_number = remove_page_number(copy.deepcopy(toc_with_page_number))
@@ -646,6 +675,9 @@ def process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_che
 
 ##check if needed to process none page numbers
 def process_none_page_numbers(toc_items, page_list, start_index=1, model=None):
+    """
+    处理目录中缺失页码/索引的项，返回包含物理页码/索引的目录 JSON 列表
+    """
     for i, item in enumerate(toc_items):
         if "physical_index" not in item:
             # logger.info(f"fix item: {item}")
@@ -686,19 +718,25 @@ def process_none_page_numbers(toc_items, page_list, start_index=1, model=None):
 
 
 def check_toc(page_list, opt=None):
+    """
+    在文档前部反复寻找连续的目录页，并判断其中是否包含页码
+    可以解决目录被某些插图等分割成几段的问题
+    如果没找到目录，直接返回；如果找到目录和页码，直接返回；如果找到目录但没找到页码，则继续往后找，直到找到页码或超过扫描页数上限
+    返回{'toc_content': toc_json['toc_content'], 'toc_page_list': toc_page_list, 'page_index_given_in_toc': 'yes/no'}
+    """
     toc_page_list = find_toc_pages(start_page_index=0, page_list=page_list, opt=opt)
     if len(toc_page_list) == 0:
         print('no toc found')
         return {'toc_content': None, 'toc_page_list': [], 'page_index_given_in_toc': 'no'}
     else:
         print('toc found')
-        toc_json = toc_extractor(page_list, toc_page_list, opt.model)
+        toc_json = toc_extractor(page_list, toc_page_list, opt.model) # 提取目录内容
 
-        if toc_json['page_index_given_in_toc'] == 'yes':
+        if toc_json['page_index_given_in_toc'] == 'yes': # 如果目录中包含页码/索引
             print('index found')
             return {'toc_content': toc_json['toc_content'], 'toc_page_list': toc_page_list, 'page_index_given_in_toc': 'yes'}
         else:
-            current_start_index = toc_page_list[-1] + 1
+            current_start_index = toc_page_list[-1] + 1 # 从目录的最后一页开始继续扫描
             
             while (toc_json['page_index_given_in_toc'] == 'no' and 
                    current_start_index < len(page_list) and 
@@ -890,6 +928,9 @@ async def fix_incorrect_toc_with_retries(toc_with_page_number, page_list, incorr
 
 ################### verify toc #########################################################
 async def verify_toc(page_list, list_result, start_index=1, N=None, model=None):
+    """
+    验证目录中物理页码/索引的正确性，返回准确率和错误项列表
+    """
     print('start verify_toc')
     # Find the last non-None physical_index
     last_physical_index = None
@@ -1019,9 +1060,12 @@ async def process_large_node_recursively(node, page_list, opt=None, logger=None)
     return node
 
 async def tree_parser(page_list, opt, doc=None, logger=None):
+    """
+    主流程函数，根据是否有目录及目录中是否包含页码，选择不同的处理方式"""
     check_toc_result = check_toc(page_list, opt)
     logger.info(check_toc_result)
 
+    # 如果有目录且目录中包含页码
     if check_toc_result.get("toc_content") and check_toc_result["toc_content"].strip() and check_toc_result["page_index_given_in_toc"] == "yes":
         toc_with_page_number = await meta_processor(
             page_list, 
